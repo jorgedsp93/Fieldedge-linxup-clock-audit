@@ -1,0 +1,11 @@
+# Apps Script / clasp
+.clasp.json
+# Editor / tooling
+.vscode/
+.idea/
+node_modules/
+# Mac / OS
+.DS_Store
+# Any ad-hoc secrets you keep locally
+*.secret.json
+*.local.json
