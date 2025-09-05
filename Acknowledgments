@@ -1,0 +1,12 @@
+
+---
+
+### 5) Quick checklist before you publish
+
+- [ ] Replaced `PIN_MATCHES` constant with the safe loader.
+- [ ] Default Looker URL is a placeholder; real URL is in Script Properties.
+- [ ] No tokens, sheet IDs, or names embedded in the code or README.
+- [ ] `.gitignore` added (especially `.clasp.json` if using clasp).
+- [ ] README pasted and edited (add screenshots if you like).
+
+If you want, I can also draft a short `LICENSE` (MIT) and a tiny `CONTRIBUTING.md` template, but the above will get you production‑safe and portfolio‑ready.
