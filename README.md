@@ -46,3 +46,48 @@ This helps ops quickly see risky behavior such as clocking in from **Home** at t
      "A. Worker": "Alice Worker",
      "B. Driver": "Bob Driver"
    }
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+(Optional) Add the on‑edit trigger via the menu (script does this automatically):
+
+Clock‑in Audit → Reset tracker / Build Clock‑in Audit menu appears when the sheet opens.
+
+Usage
+
+Paste the FieldEdge CSV at A1 of the Timesheet Raw sheet.
+
+From the menu Clock‑in Audit → Build Clock‑in Audit (CSV + Linxup).
+
+Review the Clock‑in Audit sheet:
+
+Yellow rows = Overtime (Note shows Overtime 1.5/Overtime 2 when detectable).
+
+Soft red = Home at Clock In (times within ≤ 5 minutes, or FE clock‑in ≤ Linxup start).
+
+Strong red + white text = Home at Clock Out (FE clock‑out within ≤ 5 minutes of Linxup end at Home).
+
+Note column explains why a row is highlighted.
+
+Configuration notes
+
+Minimum FE duration to consider a row valid: 3 minutes (strict “> 3”).
+
+Matching window for FE vs. Linxup candidates: 120 minutes by default.
+
+Geofence label resolution tries Usage then Stops, then Visits, then raw trip text.
+
+Privacy & Security
+
+No secrets in code: All tokens/IDs are read from Script Properties.
+
+No PII in repo: Do not commit real employee names; set them via PIN_MATCHES_JSON.
+
+Add a .gitignore (see repo) to avoid accidentally publishing IDs from .clasp.json if you use clasp.
+
+Troubleshooting
+
+“LINXUP_TOKEN not set” – Set LINXUP_TOKEN in Script Properties.
+
+“applyAuditFormattingRules_ is not defined” – This repo uses highlightOvertimeRows_() only; remove any older calls to applyAuditFormattingRules_.
+
+If geofence labels look sparse, increase LABEL_WINDOW_MIN (default 15).
