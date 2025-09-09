@@ -1,92 +1,103 @@
 /************************************************************
- * CLOCK IN vs TRIPS — FieldEdge ↔ Linxup (time-only audit)
+ * CLOCK IN vs TRIPS  FieldEdge ↔ Linxup  time only audit
  * Adds:
- *  - Pay Item column (from Timesheet Raw col I) shown between Group and FE clock-in
- *  - Ignores FE rows with Duration ≤ minClockDurMin (default 3 min) when picking clock-in/out
+ *  - Pay Item column  from Timesheet Raw col I  shown between Group and FE clock in
+ *  - Ignores FE rows with Duration ≤ minClockDurMin  default 3 min  when picking clock in out
  *  - Menu: Reset tracker, Open Looker Studio dashboard
  *  - Enforce pastes to anchor at A1 on Timesheet Raw via installable onEdit trigger
+ *  - Prefers geofence exit for left site  fallback to STOP end if idling first
  ************************************************************/
 
 /* ===================== CONFIG ===================== */
 const AUDCFG = (() => {
   const p = PropertiesService.getScriptProperties();
-  const txt = (k, d='') => p.getProperty(k) || d;
+  const txt = (k, d = '') => p.getProperty(k) || d;
   const num = (k, d) => Number(p.getProperty(k) || d);
+
   return {
     tz:                 txt('TIMEZONE', 'America/Toronto'),
 
-    // Linxup API
-    linxupHost:         txt('LINXUP_HOST', 'https://app02.linxup.com'),
-    linxupBase:         txt('LINXUP_BASE', '/ibis/rest/api/v2'),
+    // Linxup API  keep secrets in Script Properties
+    linxupHost:         txt('LINXUP_HOST', ''),
+    linxupBase:         txt('LINXUP_BASE', ''),
     linxupToken:        txt('LINXUP_TOKEN', ''),
 
     // Sheets
-    sheetId:            txt('AUDIT_SHEET_ID', ''),               // blank = active
+    sheetId:            txt('AUDIT_SHEET_ID', ''),               // blank  use active
     tsSheetName:        txt('TIMESHEET_SHEET_NAME', 'Timesheet Raw'),
-    outSheetName:       txt('AUDIT_SHEET_NAME', 'Clock-in Audit'),
+    outSheetName:       txt('AUDIT_SHEET_NAME', 'Clock in Audit'),
 
     // Windows
-    tripsPadHours:      num('AUDIT_TRIPS_PAD_HOURS', 12),        // pad around date span
-    matchWindowMin:     num('MATCH_WINDOW_MIN', 120),            // minutes radius for candidate picks
-    homeFlagMin:        num('HOME_FLAG_MIN', 5),                 // minutes for Home YES
-    labelWindowMin:     num('LABEL_WINDOW_MIN', 15),             // window used for geofence/visit lookups
+    tripsPadHours:      num('AUDIT_TRIPS_PAD_HOURS', 12),
+    matchWindowMin:     num('MATCH_WINDOW_MIN', 120),
+    homeFlagMin:        num('HOME_FLAG_MIN', 5),
+    labelWindowMin:     num('LABEL_WINDOW_MIN', 15),
 
-    // FE duration filtering (strict “over 3 minutes”)
+    // Movement filters for CLOCK OUT  left site  matching
+    minMovementMin:     num('MIN_MOVEMENT_MIN', 4),
+    minMovementKm:      num('MIN_MOVEMENT_KM', 2),
+
+    // Idle  adjust departure only if engine on while still stopped  and leave immediately after
+    idleAdjustMinMin:        num('IDLE_ADJUST_MIN_MIN', 2),
+    idleAdjustMaxWindowMin:  num('IDLE_ADJUST_MAX_WINDOW_MIN', 200),
+
+    // FE duration filtering  strict over 3 minutes
     minClockDurMin:     num('MIN_CLOCK_DUR_MIN', 3),
 
-    // Dashboards
-    lookerUrl:          txt('LOOKER_URL', 'https://lookerstudio.google.com/reporting/REPLACE_WITH_YOUR_DASHBOARD_ID')
+    // Dashboards  keep empty in public repo
+    lookerUrl:          txt('LOOKER_URL', '')
   };
 })();
 
 /* ===================== PINNED EMPLOYEES ===================== */
-/* ===================== PINNED EMPLOYEES (public-safe) ===================== */
-/* Load from Script Properties:
-   Set property "PIN_MATCHES_JSON" to a JSON object mapping the short name seen on
-   the timesheet to the Linxup/driver name you want to match against, e.g.:
-
-   {
-     "A. Worker": "Alice Worker",
-     "B. Driver": "Bob Driver"
-   }
-
-
+/* Load redacted name maps from Script Properties to avoid PII in source.
+   Property key: PIN_MATCHES_JSON
+   Example value:
+   {"A. Worker":"Alex Worker","B. Tech":"Ben Tech"}
 */
-function loadPinMatches_(){
+function getPinMatches_(){
   try{
-    const raw = PropertiesService.getScriptProperties().getProperty('PIN_MATCHES_JSON');
-    if (!raw) return {};
+    const raw = PropertiesService.getScriptProperties().getProperty('PIN_MATCHES_JSON') || '{}';
     const obj = JSON.parse(raw);
-    return obj && typeof obj === 'object' ? obj : {};
-  }catch(e){
-    return {};
-  }
+    if (obj && typeof obj === 'object') return obj;
+  }catch(e){}
+  return {};
 }
-const PIN_MATCHES = loadPinMatches_();
-
+const PIN_MATCHES = getPinMatches_();
 
 /* ===================== UTILS ===================== */
 const fmt = (d, pat) => Utilities.formatDate(d, AUDCFG.tz, pat);
 const dayKey = d => fmt(d, 'yyyy-MM-dd');
 const isDate = d => d instanceof Date && isFinite(d.getTime());
-const toNum = v => { const n = Number(v); return isFinite(n) ? n : NaN; };
+const toNum  = v => { const n = Number(v); return isFinite(n) ? n : NaN; };
 
-function isHomeLabel(lbl){
-  return norm(String(lbl || '')) === 'home';
+function normLabel_(s){
+  // lower, strip accents, remove customer: prefix, trim
+  s = norm(String(s || ''));
+  s = s.replace(/^customer:\s*/, '');
+  return s;
+}
+function labelMatchesFuzzy_(a, b){
+  const A = normLabel_(a), B = normLabel_(b);
+  if (!A || !B) return false;
+  return A.includes(B) || B.includes(A);
 }
 
 function norm(s){
-  s = String(s||'');
+  s = String(s || '');
   if (s.normalize) s = s.normalize('NFKD');
-  return s.replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
+  return s.replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
 }
-function minutesBetween(a,b){ return Math.abs(a.getTime()-b.getTime())/60000; }
+function isHomeLabel(lbl){ return norm(String(lbl || '')) === 'home'; }
+function minutesBetween(a, b){ return Math.abs(a.getTime() - b.getTime()) / 60000; }
 function preferBeforeThenClosest(cands, pivot){
   const earlier = cands.filter(c => c.dt.getTime() <= pivot.getTime());
   if (earlier.length){
-    return earlier.reduce((best,cur)=> minutesBetween(cur.dt,pivot) < minutesBetween(best.dt,pivot) ? cur : best, earlier[0]);
+    return earlier.reduce((best, cur) =>
+      minutesBetween(cur.dt, pivot) < minutesBetween(best.dt, pivot) ? cur : best, earlier[0]);
   }
-  return cands.reduce((best,cur)=> minutesBetween(cur.dt,pivot) < minutesBetween(best.dt,pivot) ? cur : best, cands[0]);
+  return cands.reduce((best, cur) =>
+    minutesBetween(cur.dt, pivot) < minutesBetween(best.dt, pivot) ? cur : best, cands[0]);
 }
 function toast_(msg){ try{ SpreadsheetApp.getActive().toast(msg); }catch(e){} }
 
@@ -98,19 +109,36 @@ function firstNonEmpty(obj, keys){
   return '';
 }
 
-/* Local date from yyyy-MM-dd to avoid UTC shift when building weekdays */
-function dateFromKeyLocal(key){
-  const parts = String(key||'').split('-').map(x=>parseInt(x,10));
-  if (parts.length !== 3 || parts.some(n=>!isFinite(n))) return null;
-  const [y,m,d] = parts;
-  return new Date(y, m-1, d, 12, 0, 0, 0); // noon local day
+/* More robust milliseconds parser  number, epoch sec ms, or date string */
+function parseMsFlexible(...cands){
+  for (const c of cands){
+    if (c === undefined || c === null || c === '') continue;
+    const n = Number(c);
+    if (isFinite(n)){
+      // Treat 13 digit as ms, 10 digit as sec
+      if (n > 3.2e10) return n;
+      if (n > 1e12)   return n;
+      if (n > 1e9)    return n * 1000;
+    }
+    const d = Date.parse(String(c));
+    if (isFinite(d)) return d;
+  }
+  return NaN;
 }
 
-/* Strip Linxup decorations: "#54 " at start and " BX12345" or similar at end */
+/* Local date from yyyy MM dd to avoid UTC shift when building weekdays */
+function dateFromKeyLocal(key){
+  const parts = String(key || '').split('-').map(x => parseInt(x, 10));
+  if (parts.length !== 3 || parts.some(n => !isFinite(n))) return null;
+  const [y, m, d] = parts;
+  return new Date(y, m - 1, d, 12, 0, 0, 0);
+}
+
+/* Strip Linxup decorations:  #54  at start and  BX12345  at end */
 function stripLinxDecorations(s){
-  return String(s||'')
-    .replace(/^#\d+\s*/,'')
-    .replace(/\s+[A-Z]{2,5}\d{2,8}\s*$/,'')
+  return String(s || '')
+    .replace(/^#\d+\s*/, '')
+    .replace(/\s+[A-Z]{2,5}\d{2,8}\s*$/, '')
     .trim();
 }
 
@@ -118,14 +146,14 @@ function stripLinxDecorations(s){
 function ensureSpreadsheet_(){
   if (AUDCFG.sheetId) return SpreadsheetApp.openById(AUDCFG.sheetId);
   const active = SpreadsheetApp.getActive();
-  return active || SpreadsheetApp.create('[Clock-in Audit]');
+  return active || SpreadsheetApp.create('[Clock in Audit]');
 }
 function ensureTimesheetSheet_(){
   const ss = ensureSpreadsheet_();
   let sh = ss.getSheetByName(AUDCFG.tsSheetName);
   if (!sh){
     sh = ss.insertSheet(AUDCFG.tsSheetName);
-    // Leave blank. You will paste CSV at A1
+    // Leave blank  you will paste CSV at A1
   }
   return sh;
 }
@@ -139,10 +167,10 @@ function ensureAuditSheet_(){
 /* ===================== CSV LOAD ===================== */
 function _parseDateTime(dateCell, timeCell){
   if (isDate(timeCell)) return new Date(timeCell.getTime());
-  const t = String(timeCell||'').trim();
+  const t = String(timeCell || '').trim();
   let dt = new Date(t);
   if (!isDate(dt)){
-    const d = isDate(dateCell) ? Utilities.formatDate(dateCell, AUDCFG.tz, 'yyyy-MM-dd') : String(dateCell||'').trim();
+    const d = isDate(dateCell) ? Utilities.formatDate(dateCell, AUDCFG.tz, 'yyyy-MM-dd') : String(dateCell || '').trim();
     if (d && t) dt = new Date(`${d} ${t}`);
   }
   return isDate(dt) ? dt : null;
@@ -152,7 +180,7 @@ function loadTimesheetEntries_(){
   const sh = ensureTimesheetSheet_();
   const vals = sh.getDataRange().getValues();
   if (vals.length <= 1) return [];
-  const head = vals.shift().map(v=>String(v||'').trim().toLowerCase());
+  const head = vals.shift().map(v => String(v || '').trim().toLowerCase());
 
   const iEmp   = head.indexOf('employee');
   const iDate  = head.indexOf('status date');
@@ -162,20 +190,20 @@ function loadTimesheetEntries_(){
   const iPay   = head.indexOf('pay item');
 
   const rows = [];
-  vals.forEach(r=>{
-    const emp = String(r[iEmp]||'').trim();
+  vals.forEach(r => {
+    const emp = String(r[iEmp] || '').trim();
     if (!emp) return;
 
     const start = _parseDateTime(r[iDate], r[iStart]);
     const end   = _parseDateTime(r[iDate], r[iEnd]);
 
-    // Read duration from column; if missing/NaN, compute from times
+    // Read duration from column  if missing NaN  compute from times
     let durationMin = iDur >= 0 ? toNum(r[iDur]) : NaN;
     if (!isFinite(durationMin) && isDate(start) && isDate(end)){
-      durationMin = (end.getTime() - start.getTime())/60000;
+      durationMin = (end.getTime() - start.getTime()) / 60000;
     }
 
-    const pay   = String(iPay >= 0 ? r[iPay] : '').trim();
+    const pay = String(iPay >= 0 ? r[iPay] : '').trim();
 
     rows.push({
       employee: emp,
@@ -188,15 +216,14 @@ function loadTimesheetEntries_(){
   return rows;
 }
 
-/* ===================== FE DAY SUMMARY (Clock-in/Clock-out) ===================== */
-/* Per employee per day: first valid clock-in and last valid clock-out + chosen pay item */
+/* ===================== FE DAY SUMMARY ===================== */
 function summarizeTimesheet_(){
   const rows = loadTimesheetEntries_();
-  const map = new Map(); // key: emp|YYYY-MM-DD
+  const map = new Map(); // key: emp|YYYY MM DD
 
-  const isValid = (row) => isFinite(row.durationMin) && row.durationMin > AUDCFG.minClockDurMin;
+  const isValid = row => isFinite(row.durationMin) && row.durationMin > AUDCFG.minClockDurMin;
 
-  rows.forEach(r=>{
+  rows.forEach(r => {
     const dates = [];
     if (isDate(r.start)) dates.push(r.start);
     if (isDate(r.end))   dates.push(r.end);
@@ -213,26 +240,22 @@ function summarizeTimesheet_(){
         feOut: null,
         payIn: '',
         payOut: '',
-        paysAll: [] // collect every pay code from valid rows
+        paysAll: []
       });
     }
     const slot = map.get(k);
 
-    // only consider rows that last "over 3 minutes" (strict)
     if (isValid(r)) {
-      // pay capture from valid rows only
       if (r.pay && String(r.pay).trim()) slot.paysAll.push(String(r.pay).trim());
 
-      // earliest valid start
       if (isDate(r.start)){
         if (!slot.feIn || r.start.getTime() < slot.feIn.getTime()){
           slot.feIn = r.start;
           slot.payIn = r.pay || slot.payIn;
         }
       }
-      // latest valid end
       if (isDate(r.end)){
-        if (!slot.feOut || r.end.getTime()  > slot.feOut.getTime()){
+        if (!slot.feOut || r.end.getTime() > slot.feOut.getTime()){
           slot.feOut = r.end;
           slot.payOut = r.pay || slot.payOut;
         }
@@ -245,13 +268,13 @@ function summarizeTimesheet_(){
     dateKey: s.dateKey,
     feIn: s.feIn,
     feOut: s.feOut,
-    payItem: choosePayItemForDay_(s) // smart Pay Item selection
+    payItem: choosePayItemForDay_(s)
   }));
 
-  return out.sort((a,b)=> a.dateKey.localeCompare(b.dateKey) || String(a.employee).localeCompare(String(b.employee)));
+  return out.sort((a, b) =>
+    a.dateKey.localeCompare(b.dateKey) || String(a.employee).localeCompare(String(b.employee)));
 }
 
-/* Prefer any Overtime code if present that day; else last code; else first; else blank */
 function choosePayItemForDay_(slot){
   const uniq = Array.from(new Set((slot.paysAll || []).filter(Boolean)));
   const ot = uniq.find(p => /overtime/i.test(p));
@@ -263,33 +286,38 @@ function choosePayItemForDay_(slot){
 
 /* Map pinned employee to labels */
 function mapEmployeeToLabels_(employee){
-  const v = PIN_MATCHES[employee] || PIN_MATCHES[employee.replace(/\.$/,'')];
+  const v = PIN_MATCHES[employee] || PIN_MATCHES[employee.replace(/\.$/, '')];
   if (!v) return [];
   if (Array.isArray(v)) return v.filter(Boolean);
   return [v];
 }
 
 /* ===================== LINXUP API CORE ===================== */
+function safeHttpError_(code, path, bodyText){
+  const short = String(bodyText || '').slice(0, 160);
+  throw new Error(`HTTP ${code} at ${path}. Body preview trimmed.`);
+}
+
 function _linxupFetch_(method, path, body){
-  if (!AUDCFG.linxupToken) throw new Error('LINXUP_TOKEN not set.');
+  if (!AUDCFG.linxupToken) throw new Error('LINXUP_TOKEN not set in Script Properties');
   const url = `${AUDCFG.linxupHost}${AUDCFG.linxupBase}${path}`;
   const opts = {
     method: method || 'post',
-    headers: { Authorization: 'Bearer '+AUDCFG.linxupToken, Accept: 'application/json' },
+    headers: { Authorization: 'Bearer ' + AUDCFG.linxupToken, Accept: 'application/json' },
     muteHttpExceptions: true
   };
-  if (String(method||'post').toLowerCase() === 'post'){
+  if (String(method || 'post').toLowerCase() === 'post'){
     opts.contentType = 'application/json';
-    opts.payload = JSON.stringify(body||{});
+    opts.payload = JSON.stringify(body || {});
   }
   const resp = UrlFetchApp.fetch(url, opts);
   const code = resp.getResponseCode();
   const txt  = resp.getContentText() || '';
-  if (code<200 || code>=300) throw new Error(`HTTP ${code} ${path}: ${txt.slice(0,500)}`);
-  try{ return JSON.parse(txt); }catch(e){ throw new Error(`${path} parse error: ${txt.slice(0,300)}`); }
+  if (code < 200 || code >= 300) return safeHttpError_(code, path, txt);
+  try { return JSON.parse(txt); } catch(e){ throw new Error(`JSON parse error at ${path}`); }
 }
 
-/* Normalizers for array responses */
+/* ===================== ARRAY NORMALIZERS ===================== */
 function _arrTrips(j){
   if (Array.isArray(j)) return j;
   if (j && j.data && Array.isArray(j.data.trips)) return j.data.trips;
@@ -317,80 +345,80 @@ function _arrVisits(j){
   return [];
 }
 
-/* Trips: prefer advanced, then standard */
+/* Trips  prefer advanced, then standard */
 function fetchTripsWindow_(start, end){
   try{
     const ja = _linxupFetch_('post', '/advancedTrips', { fromDate: start.getTime(), toDate: end.getTime() });
     const arrA = _arrTrips(ja);
     if (arrA.length) return arrA;
-  }catch(e){ /* ignore; fall through */ }
+  }catch(e){ /* ignore */ }
   const j = _linxupFetch_('post', '/trips', { fromDate: start.getTime(), toDate: end.getTime() });
   return _arrTrips(j);
 }
 
-/* Batched pulls where endpoints limit to ≤48h */
+/* Batched pulls where endpoints limit to 48h or less */
 function batched_(from, to, sliceMs, fetcher){
-  const OVER = 2*60000;
+  const OVER = 2 * 60000;
   const out = [];
   let cur = new Date(from);
   while (cur.getTime() < to.getTime()){
-    const segEnd = new Date(Math.min(cur.getTime()+sliceMs, to.getTime()));
+    const segEnd = new Date(Math.min(cur.getTime() + sliceMs, to.getTime()));
     let seg = [];
     try{ seg = fetcher(cur, segEnd) || []; }catch(e){ /* swallow segment errors */ }
     if (Array.isArray(seg) && seg.length) out.push(...seg);
     if (segEnd.getTime() >= to.getTime()) break;
-    cur = new Date(segEnd.getTime()-OVER);
+    cur = new Date(segEnd.getTime() - OVER);
   }
   return out;
 }
 function fetchTripsBatched_(start, end){
-  const SLICE = 47*3600000;
+  const SLICE = 47 * 3600000;
   const seen = new Set();
-  const out  = batched_(start, end, SLICE, (a,b)=>fetchTripsWindow_(a,b));
+  const out  = batched_(start, end, SLICE, (a, b) => fetchTripsWindow_(a, b));
   const uniq = [];
-  out.forEach(t=>{
+  out.forEach(t => {
     const k = String(t.tripUUID || '') ||
-      [(t.deviceUUID||t.deviceNumber||''),(t.startDateTime||t.formattedStartDateTime||''),(t.endDateTime||t.formattedEndDateTime||''),(t.distanceMilesDetailed||t.distanceMiles||'')].join('|');
+      [(t.deviceUUID || t.deviceNumber || ''), (t.startDateTime || t.formattedStartDateTime || ''), (t.endDateTime || t.formattedEndDateTime || ''), (t.distanceMilesDetailed || t.distanceMiles || '')].join('|');
     if (!seen.has(k)){ seen.add(k); uniq.push(t); }
   });
   return uniq;
 }
 function fetchUsageBatched_(start, end){
-  const SLICE = 47*3600000;
-  return batched_(start, end, SLICE, (a,b)=>_arrUsage(_linxupFetch_('post','/usagehours',{ fromDate:a.getTime(), toDate:b.getTime() })));
+  const SLICE = 47 * 3600000;
+  return batched_(start, end, SLICE, (a, b) => _arrUsage(_linxupFetch_('post', '/usagehours', { fromDate: a.getTime(), toDate: b.getTime() })));
 }
 function fetchStopsBatched_(start, end){
-  const SLICE = 47*3600000;
-  return batched_(start, end, SLICE, (a,b)=>_arrStops(_linxupFetch_('post','/stops',{ fromDate:a.getTime(), toDate:b.getTime() })));
+  const SLICE = 47 * 3600000;
+  return batched_(start, end, SLICE, (a, b) => _arrStops(_linxupFetch_('post', '/stops', { fromDate: a.getTime(), toDate: b.getTime() })));
 }
 function fetchVisitsBatched_(start, end){
-  const SLICE = 47*3600000; // fix 422: keep ≤48h
-  return batched_(start, end, SLICE, (a,b)=>_arrVisits(_linxupFetch_('post','/customers/visits',{ startDate:a.getTime(), endDate:b.getTime() })));
+  const SLICE = 47 * 3600000;
+  return batched_(start, end, SLICE, (a, b) => _arrVisits(_linxupFetch_('post', '/customers/visits', { startDate: a.getTime(), endDate: b.getTime() })));
 }
 
-/* Trackers & Groups → deviceUUID → groupName map */
+/* Trackers and Groups  deviceUUID → groupName map */
 function buildGroupMaps_(){
   let trackers = [];
   let groups = [];
-  try{ trackers = _linxupFetch_('get','/tracker') || []; }catch(e){}
-  try{ groups   = _linxupFetch_('get','/groups')  || []; }catch(e){}
+  try{ trackers = _linxupFetch_('get', '/tracker') || []; }catch(e){}
+  try{ groups   = _linxupFetch_('get', '/groups')  || []; }catch(e){}
 
   const gidToName = new Map();
-  groups.forEach(g=>{
-    const id = String(g.groupId||'').trim();
-    const nm = firstNonEmpty(g, ['groupName','groupDesc']);
-    if (id) gidToName.set(id, nm||'');
+  groups.forEach(g => {
+    const id = String(g.groupId || '').trim();
+    const nm = firstNonEmpty(g, ['groupName', 'groupDesc']);
+    if (id) gidToName.set(id, nm || '');
   });
 
   const devUUIDToGroup = new Map();
   const driverBaseToGroup = new Map();
-  trackers.forEach(t=>{
+  trackers.forEach(t => {
     const uuid = String(t.deviceUUID || '').trim();
     const gid  = String(t.groupId || '').trim();
     const gnm  = gidToName.get(gid) || '';
     if (uuid) devUUIDToGroup.set(uuid, gnm);
 
-    const drv = `${t.firstName||''} ${t.lastName||''}`.trim();
+    const drv = `${t.firstName || ''} ${t.lastName || ''}`.trim();
     if (drv){
       const base = norm(stripLinxDecorations(drv));
       if (base) driverBaseToGroup.set(base, gnm);
@@ -400,19 +428,37 @@ function buildGroupMaps_(){
   return { devUUIDToGroup, driverBaseToGroup };
 }
 
-/* ===================== NORMALIZATION & INDEXES ===================== */
+/* ===================== NORMALIZATION and INDEXES ===================== */
 function normalizeTrip_(t){
-  const sMs = toNum(t.startDateTime ?? Date.parse(String(t.formattedStartDateTime||'')));
-  const eMs = toNum(t.endDateTime   ?? Date.parse(String(t.formattedEndDateTime  ||'')));
+  const sMs = parseMsFlexible(t.startDateTime, t.formattedStartDateTime);
+  const eMs = parseMsFlexible(t.endDateTime,   t.formattedEndDateTime);
+
   const driver = String(
-    t.firstName ? `${t.firstName} ${t.lastName||''}`.trim()
+    t.firstName ? `${t.firstName} ${t.lastName || ''}`.trim()
                 : (t.driverName || t.appDriverName || '')
   ).trim();
   const device = String(t.deviceName || t.vehicleName || t.vehicleLabel || t.deviceLabel || t.label || '').trim();
 
-  const rawStartLoc = firstNonEmpty(t, ['startLocation','startAddress']);
-  const rawEndLoc   = firstNonEmpty(t, ['endLocation','endAddress']);
-  const groupName   = firstNonEmpty(t, ['fleetName','groupName','fleet','group']);
+  const rawStartLoc = firstNonEmpty(t, ['startLocation', 'startAddress']);
+  const rawEndLoc   = firstNonEmpty(t, ['endLocation', 'endAddress']);
+  const groupName   = firstNonEmpty(t, ['fleetName', 'groupName', 'fleet', 'group']);
+
+  const durationMin = (() => {
+    const candsMin = [t.durationMinutes, t.driveTimeMinutes, t.tripMinutes];
+    for (const v of candsMin){ const n = toNum(v); if (isFinite(n)) return n; }
+    const candsSec = [t.durationSeconds, t.driveTimeSeconds, t.seconds];
+    for (const v of candsSec){ const n = toNum(v); if (isFinite(n)) return n / 60; }
+    if (isFinite(sMs) && isFinite(eMs)) return (eMs - sMs) / 60000;
+    return NaN;
+  })();
+
+  const distanceMiles = (() => {
+    const candMi = [t.distanceMilesDetailed, t.distanceMiles, t.miles, t.distance];
+    for (const v of candMi){ const n = toNum(v); if (isFinite(n)) return n; }
+    const candKm = [t.distanceKilometers, t.distanceKilometres, t.distanceKm, t.kilometers, t.kms];
+    for (const v of candKm){ const n = toNum(v); if (isFinite(n)) return n * 0.621371; }
+    return NaN;
+  })();
 
   return {
     start: isFinite(sMs) ? new Date(sMs) : null,
@@ -424,38 +470,44 @@ function normalizeTrip_(t){
     deviceNumber: String(t.deviceNumber || t.imei || '').trim(),
     rawStartLoc, rawEndLoc,
     groupName,
+    durationMin: isFinite(durationMin) ? durationMin : NaN,
+    distanceMiles: isFinite(distanceMiles) ? distanceMiles : NaN,
     __raw: t
   };
+}
+
+function devKeyOfTrip_(t){
+  return String((t && (t.deviceUUID || t.deviceNumber || t.imei)) || '').trim();
 }
 
 function tripMatchesByNameLoose_(trip, labels){
   if (!labels || !labels.length) return false;
   const base = norm(stripLinxDecorations(trip.driverFull));
   if (!base) return false;
-  return labels.some(lbl=>{
+  return labels.some(lbl => {
     const want = norm(lbl);
     return base.includes(want) || want.includes(base);
   });
 }
 
-/* Per-day buckets to speed lookups */
+/* Per day buckets to speed lookups */
 function bucketTripsByLabelDay_(trips){
-  const m = new Map(); // key: label|YYYY-MM-DD -> trips[]
-  trips.forEach(t=>{
+  const m = new Map(); // key: label|YYYY MM DD  list of trips
+  trips.forEach(t => {
     if (!isDate(t.start) && !isDate(t.end)) return;
     const any = isDate(t.start) ? t.start : t.end;
     const dkey = dayKey(any);
     const labels = [t.driverFull, t.deviceName].filter(Boolean);
-    labels.forEach(lbl=>{
+    labels.forEach(lbl => {
       const k = `${lbl}|${dkey}`;
       if (!m.has(k)) m.set(k, []);
       m.get(k).push(t);
     });
   });
-  m.forEach(list=>{
-    list.sort((a,b)=>{
-      const aT = (isDate(a.start)?a.start.getTime():0) || (isDate(a.end)?a.end.getTime():0);
-      const bT = (isDate(b.start)?b.start.getTime():0) || (isDate(b.end)?b.end.getTime():0);
+  m.forEach(list => {
+    list.sort((a, b) => {
+      const aT = (isDate(a.start) ? a.start.getTime() : 0) || (isDate(a.end) ? a.end.getTime() : 0);
+      const bT = (isDate(b.start) ? b.start.getTime() : 0) || (isDate(b.end) ? b.end.getTime() : 0);
       return aT - bT;
     });
   });
@@ -465,11 +517,11 @@ function bucketTripsByLabelDay_(trips){
 /* Index usage hours and stops by device for geofence labels */
 function indexUsage_(rows){
   const byDev = new Map();
-  rows.forEach(r=>{
+  rows.forEach(r => {
     const dev = String(r.deviceUUID || r.deviceNbr || r.imei || '').trim();
     if (!dev) return;
-    const sMs = toNum(r.startDateTime ?? r.startDate ?? Date.parse(String(r.formattedStartDateTime||'')));
-    const eMs = toNum(r.endDateTime   ?? r.endDate   ?? Date.parse(String(r.formattedEndDateTime  ||'')));
+    const sMs = parseMsFlexible(r.startDateTime, r.startDate, r.formattedStartDateTime);
+    const eMs = parseMsFlexible(r.endDateTime,   r.endDate,   r.formattedEndDateTime);
     if (!isFinite(sMs) && !isFinite(eMs)) return;
     const rec = {
       start: isFinite(sMs) ? new Date(sMs) : null,
@@ -481,8 +533,8 @@ function indexUsage_(rows){
     if (!byDev.has(dev)) byDev.set(dev, []);
     byDev.get(dev).push(rec);
   });
-  byDev.forEach(list=>{
-    list.sort((a,b)=>{
+  byDev.forEach(list => {
+    list.sort((a, b) => {
       const aT = (a.start && a.start.getTime()) || (a.end && a.end.getTime()) || 0;
       const bT = (b.start && b.start.getTime()) || (b.end && b.end.getTime()) || 0;
       return aT - bT;
@@ -492,11 +544,11 @@ function indexUsage_(rows){
 }
 function indexStops_(rows){
   const byDev = new Map();
-  rows.forEach(r=>{
+  rows.forEach(r => {
     const dev = String(r.deviceUUID || r.deviceNbr || r.imei || '').trim();
     if (!dev) return;
-    const sMs = toNum(r.beginDate ?? r.startDateTime ?? Date.parse(String(r.formattedStartDateTime||'')));
-    const eMs = toNum(r.endDate   ?? r.endDateTime   ?? Date.parse(String(r.formattedEndDateTime  ||'')));
+    const sMs = parseMsFlexible(r.beginDate, r.startDateTime, r.formattedStartDateTime);
+    const eMs = parseMsFlexible(r.endDate,   r.endDateTime,   r.formattedEndDateTime);
     if (!isFinite(sMs) && !isFinite(eMs)) return;
     const rec = {
       start: isFinite(sMs) ? new Date(sMs) : null,
@@ -507,8 +559,8 @@ function indexStops_(rows){
     if (!byDev.has(dev)) byDev.set(dev, []);
     byDev.get(dev).push(rec);
   });
-  byDev.forEach(list=>{
-    list.sort((a,b)=>{
+  byDev.forEach(list => {
+    list.sort((a, b) => {
       const aT = (a.start && a.start.getTime()) || (a.end && a.end.getTime()) || 0;
       const bT = (b.start && b.start.getTime()) || (b.end && b.end.getTime()) || 0;
       return aT - bT;
@@ -517,31 +569,196 @@ function indexStops_(rows){
   return byDev;
 }
 function indexVisits_(rows){
-  // visits do not carry deviceUUID; we time-match and driver-name-match loosely
-  return rows.map(v=>({
-    start: new Date(Number(v.startDate||v.start||0)),
-    end:   new Date(Number(v.endDate||v.end||0)),
+  return rows.map(v => ({
+    start: new Date(Number(v.startDate || v.start || 0)),
+    end:   new Date(Number(v.endDate || v.end || 0)),
     customerName: firstNonEmpty(v, ['customerName']),
     driverName:   firstNonEmpty(v, ['driverName']),
     trackerName:  firstNonEmpty(v, ['trackerName'])
   })).filter(r => (isDate(r.start) || isDate(r.end)));
 }
 
-/* Label helpers: Usage (priority), then Stops, then Visits, then trip text */
+/* ===================== GEOFENCE ACTIVITY  enter exit ===================== */
+function _arrFenceActivity(j){
+  if (Array.isArray(j)) return j;
+  if (j && Array.isArray(j.items)) return j.items;
+  if (j && Array.isArray(j.data)) return j.data;
+  if (j && Array.isArray(j.activity)) return j.activity;
+  return [];
+}
+function fetchFenceActivityWindow_(start, end){
+  const limit = 1000;
+  let offset = 0;
+  const out = [];
+  while (true){
+    const body = { start: start.getTime(), end: end.getTime(), limit, offset };
+    let arr = [];
+    try{
+      const j = _linxupFetch_('post', '/geofences/activity', body);
+      arr = _arrFenceActivity(j);
+    }catch(e){ arr = []; }
+    if (arr && arr.length) out.push(...arr);
+    if (!arr || arr.length < limit) break;
+    offset += limit;
+  }
+  return out;
+}
+function fetchFenceActivityBatched_(start, end){
+  const SLICE = 47 * 3600000;
+  return batched_(start, end, SLICE, (a, b) => fetchFenceActivityWindow_(a, b));
+}
+function indexFenceActivity_(rows){
+  const byDev = new Map();
+  rows.forEach(r => {
+    const dev = String(r.deviceUUID || r.deviceNbr || r.imei || '').trim();
+    if (!dev) return;
+    const ent = parseMsFlexible(r.enterDateTime, r.enterDate, r.startDateTime, r.formattedEnterDateTime);
+    const ex  = parseMsFlexible(r.exitDateTime,  r.exitDate,  r.endDateTime,   r.formattedExitDateTime);
+    const rec = {
+      enter: isFinite(ent) ? new Date(ent) : null,
+      exit:  isFinite(ex)  ? new Date(ex)  : null,
+      fenceName: firstNonEmpty(r, ['fenceName', 'geofenceName']),
+      fenceUUID: firstNonEmpty(r, ['fenceUUID', 'geofenceUUID'])
+    };
+    if (!byDev.has(dev)) byDev.set(dev, []);
+    byDev.get(dev).push(rec);
+  });
+  byDev.forEach(list => list.sort((a, b) => {
+    const aT = (a.enter && a.enter.getTime()) || 0;
+    const bT = (b.enter && b.enter.getTime()) || 0;
+    return aT - bT;
+  }));
+  return byDev;
+}
+
+/* Prefer the geofence that contains the trip start time  else STOP end */
+function geofenceExitFromActivity_(faIdx, deviceKey, startMs, endMs, labelWanted){
+  if (!faIdx || !deviceKey || !isFinite(startMs)) return null;
+  const list = faIdx.get(deviceKey);
+  if (!list || !list.length) return null;
+
+  const want = normLabel_(labelWanted);
+  const maxIdleMs = Math.max(1, Number(AUDCFG.idleAdjustMaxWindowMin || 45)) * 60000;
+  const minIdleMs = Math.max(0, Number(AUDCFG.idleAdjustMinMin || 2)) * 60000;
+
+  const hardUpper = isFinite(endMs) ? Math.min(endMs, startMs + maxIdleMs) : startMs + maxIdleMs;
+
+  let best = null;
+  let bestDelta = Infinity;
+
+  // pass 1  require fuzzy label match and time containment
+  for (const rec of list){
+    const ent = rec.enter && rec.enter.getTime();
+    const ex  = rec.exit  && rec.exit.getTime();
+    if (!isFinite(ent) || !isFinite(ex)) continue;
+
+    if (!(ent <= startMs && startMs <= ex)) continue;
+    if (ex < startMs || ex > hardUpper) continue;
+    if (want && !labelMatchesFuzzy_(rec.fenceName, want)) continue;
+
+    const delta = ex - startMs;
+    if (delta >= minIdleMs && delta < bestDelta){
+      bestDelta = delta;
+      best = { dt: new Date(ex), idleMin: delta / 60000, label: rec.fenceName || '' };
+    }
+  }
+  // pass 2  allow any fence containing start within window
+  if (!best){
+    for (const rec of list){
+      const ent = rec.enter && rec.enter.getTime();
+      const ex  = rec.exit  && rec.exit.getTime();
+      if (!isFinite(ent) || !isFinite(ex)) continue;
+
+      if (!(ent <= startMs && startMs <= ex)) continue;
+      if (ex < startMs || ex > hardUpper) continue;
+
+      const delta = ex - startMs;
+      if (delta >= minIdleMs && delta < bestDelta){
+        bestDelta = delta;
+        best = { dt: new Date(ex), idleMin: delta / 60000, label: rec.fenceName || '' };
+      }
+    }
+  }
+  return best;
+}
+
+/* Trip must represent real movement */
+function tripIsEligibleMovement_(trip){
+  const minMin   = Number(AUDCFG.minMovementMin || 4);
+  const minKm    = Number(AUDCFG.minMovementKm || 2);
+  const minMiles = minKm * 0.621371;
+
+  if (isFinite(trip.durationMin)   && trip.durationMin   < minMin)   return false;
+  if (isFinite(trip.distanceMiles) && trip.distanceMiles < minMiles) return false;
+
+  return isFinite(trip.durationMin) || isFinite(trip.distanceMiles);
+}
+
+/* If start is still inside a STOP  idling  move departure to STOP end */
+function adjustDepartureImmediateStopEnd_(trip, tripStartDT, startLabel, stopsIdx){
+  const out = { dt: tripStartDT, adjusted: false, idleMin: 0 };
+  if (!trip || !isDate(tripStartDT) || !stopsIdx) return out;
+  if (!tripIsEligibleMovement_(trip)) return out;
+
+  const devKey = devKeyOfTrip_(trip);
+  const list = stopsIdx.get(devKey);
+  if (!list || !list.length) return out;
+
+  const startMs   = tripStartDT.getTime();
+  const endMs     = isDate(trip.end) ? trip.end.getTime() : NaN;
+  const maxIdleMs = Math.max(1, Number(AUDCFG.idleAdjustMaxWindowMin || 45)) * 60000;
+  const minIdleMs = Math.max(0, Number(AUDCFG.idleAdjustMinMin || 2)) * 60000;
+  const hardUpper = isFinite(endMs) ? Math.min(endMs, startMs + maxIdleMs) : startMs + maxIdleMs;
+  const want      = normLabel_(startLabel);
+
+  let best = null;
+  let bestDelta = Infinity;
+
+  // prefer matching label
+  for (const s of list){
+    const st = s.start && s.start.getTime();
+    const en = s.end   && s.end.getTime();
+    if (!isFinite(st) || !isFinite(en)) continue;
+
+    if (!(st <= startMs && startMs <= en)) continue;
+    if (en < startMs || en > hardUpper) continue;
+
+    if (want && !labelMatchesFuzzy_(s.geofenceName, want)) continue;
+
+    const delta = en - startMs;
+    if (delta >= minIdleMs && delta < bestDelta){
+      bestDelta = delta;
+      best = { dt: new Date(en), idleMin: delta / 60000 };
+    }
+  }
+  // fallback  any stop containing the start  within the window
+  if (!best){
+    for (const s of list){
+      const st = s.start && s.start.getTime();
+      const en = s.end   && s.end.getTime();
+      if (!isFinite(st) || !isFinite(en)) continue;
+      if (!(st <= startMs && startMs <= en)) continue;
+      if (en < startMs || en > hardUpper) continue;
+
+      const delta = en - startMs;
+      if (delta >= minIdleMs && delta < bestDelta){
+        bestDelta = delta;
+        best = { dt: new Date(en), idleMin: delta / 60000 };
+      }
+    }
+  }
+
+  return best ? { dt: best.dt, adjusted: true, idleMin: best.idleMin } : out;
+}
+
 function overtimeNoteFromPayItem_(payItem){
   const raw = String(payItem || '').trim();
   if (!raw) return '';
-
   const s = raw.toLowerCase();
-
-  // Bail if not clearly overtime
   if (!/(?:\bot\b|\bovertime\b|double\s*time|time\s*and\s*(?:a\s*)?half)/.test(s)) return '';
-
-  // Try to extract a numeric multiplier
   let mult = null;
   let m = s.match(/(?:\bot\b|\bovertime\b)[^\d]{0,3}(\d+(?:\.\d+)?)/);
   if (m) mult = parseFloat(m[1]);
-
   if (mult == null) {
     if (/double\s*time|\bdt\b/.test(s)) mult = 2;
     else if (/time\s*and\s*(?:a\s*)?half|\btah\b/.test(s)) mult = 1.5;
@@ -550,107 +767,106 @@ function overtimeNoteFromPayItem_(payItem){
     m = s.match(/\b(1\.5|2(?:\.0)?)\b/);
     if (m) mult = parseFloat(m[1]);
   }
-
   if (mult == null) return 'Overtime';
   const clean = (Math.round(mult * 10) / 10).toString().replace(/\.0$/, '');
   return `Overtime ${clean}`;
 }
 
-
-function labelFromUsage_(usageIdx, deviceUUID, whenMs, side){
-  if (!deviceUUID || !usageIdx) return { label:'', group:'' };
-  const list = usageIdx.get(deviceUUID);
-  if (!list || !list.length) return { label:'', group:'' };
+function labelFromUsage_(usageIdx, deviceKey, whenMs, side){
+  if (!deviceKey || !usageIdx) return { label: '', group: '' };
+  const list = usageIdx.get(deviceKey);
+  if (!list || !list.length) return { label: '', group: '' };
   const win = Math.max(1, AUDCFG.labelWindowMin) * 60000;
   let best = null, bestDist = Infinity;
-  list.forEach(u=>{
+  list.forEach(u => {
     const st = u.start && u.start.getTime();
     const en = u.end && u.end.getTime();
-    const mid = isFinite(st) && isFinite(en) ? (st+en)/2 : (isFinite(st)?st:en);
+    const mid = isFinite(st) && isFinite(en) ? (st + en) / 2 : (isFinite(st) ? st : en);
     if (!isFinite(mid)) return;
     const dist = Math.abs(mid - whenMs);
     if (dist <= win && dist < bestDist){ best = u; bestDist = dist; }
   });
-  if (!best) return { label:'', group:'' };
+  if (!best) return { label: '', group: '' };
   const label = side === 'start' ? best.startGeofenceName : best.endGeofenceName;
-  return { label: label||'', group: best.fleetName||'' };
+  return { label: label || '', group: best.fleetName || '' };
 }
-function labelFromStops_(stopsIdx, deviceUUID, whenMs){
-  if (!deviceUUID || !stopsIdx) return { label:'', group:'' };
-  const list = stopsIdx.get(deviceUUID);
-  if (!list || !list.length) return { label:'', group:'' };
+function labelFromStops_(stopsIdx, deviceKey, whenMs){
+  if (!deviceKey || !stopsIdx) return { label: '', group: '' };
+  const list = stopsIdx.get(deviceKey);
+  if (!list || !list.length) return { label: '', group: '' };
   const win = Math.max(1, AUDCFG.labelWindowMin) * 60000;
   let best = null, bestDist = Infinity;
-  list.forEach(s=>{
+  list.forEach(s => {
     const st = s.start && s.start.getTime();
     const en = s.end && s.end.getTime();
     let dist;
     if (isFinite(st) && isFinite(en) && st <= whenMs && whenMs <= en){
-      dist = 0; // inside the stop
+      dist = 0;
     } else {
-      const mid = isFinite(st) && isFinite(en) ? (st+en)/2 : (isFinite(st)?st:en);
+      const mid = isFinite(st) && isFinite(en) ? (st + en) / 2 : (isFinite(st) ? st : en);
       if (!isFinite(mid)) return;
       dist = Math.abs(mid - whenMs);
     }
     if (dist <= win && dist < bestDist){ best = s; bestDist = dist; }
   });
-  if (!best) return { label:'', group:'' };
-  return { label: best.geofenceName||'', group: best.fleetName||'' };
+  if (!best) return { label: '', group: '' };
+  return { label: best.geofenceName || '', group: best.fleetName || '' };
 }
 function labelFromVisits_(visits, trip, whenMs){
   if (!visits || !visits.length) return '';
-  const base = norm(stripLinxDecorations(trip.driverFull));
+  const base = norm(stripLinxupDecorations(trip.driverFull));
   const win = Math.max(1, AUDCFG.labelWindowMin) * 60000;
   let best = null, bestDist = Infinity;
-  visits.forEach(v=>{
-    const visitDriver = norm(stripLinxDecorations(v.driverName||''));
-    if (base && visitDriver && !(base.includes(visitDriver)||visitDriver.includes(base))) return;
+  visits.forEach(v => {
+    const visitDriver = norm(stripLinxupDecorations(v.driverName || ''));
+    if (base && visitDriver && !(base.includes(visitDriver) || visitDriver.includes(base))) return;
     const st = v.start && v.start.getTime();
     const en = v.end && v.end.getTime();
-    const mid = isFinite(st) && isFinite(en) ? (st+en)/2 : (isFinite(st)?st:en);
+    const mid = isFinite(st) && isFinite(en) ? (st + en) / 2 : (isFinite(st) ? st : en);
     if (!isFinite(mid)) return;
     const dist = Math.abs(mid - whenMs);
     if (dist <= win && dist < bestDist){ best = v; bestDist = dist; }
   });
-  return best ? (best.customerName||'') : '';
+  return best ? (best.customerName || '') : '';
 }
 
 /* ===================== PICKERS ===================== */
 function pickArrivalEnd_(tripsDay, feClockIn){
   if (!isDate(feClockIn)) return null;
-  const within = (t) => isDate(t.end) && minutesBetween(t.end, feClockIn) <= AUDCFG.matchWindowMin;
-  const cands = tripsDay.filter(within).map(t=>({dt:t.end, src:t}));
+  const within = t => isDate(t.end) && minutesBetween(t.end, feClockIn) <= AUDCFG.matchWindowMin;
+  const cands = tripsDay.filter(within).map(t => ({ dt: t.end, src: t }));
   if (!cands.length) return null;
   return preferBeforeThenClosest(cands, feClockIn);
 }
 function pickLeaveStart_(tripsDay, feClockOut){
   if (!isDate(feClockOut)) return null;
-  const within = (t) => isDate(t.start) && minutesBetween(t.start, feClockOut) <= AUDCFG.matchWindowMin;
-  const cands = tripsDay.filter(within).map(t=>({dt:t.start, src:t}));
-  if (!cands.length) return null;
+  const within = t => isDate(t.start) && minutesBetween(t.start, feClockOut) <= AUDCFG.matchWindowMin;
+  const eligible = tripsDay.filter(t => within(t) && tripIsEligibleMovement_(t));
+  if (!eligible.length) return null;
+  const cands = eligible.map(t => ({ dt: t.start, src: t }));
   return preferBeforeThenClosest(cands, feClockOut);
 }
 function firstStartOfDay_(tripsDay){
-  const starts = tripsDay.map(t=>t.start).filter(isDate);
+  const starts = tripsDay.map(t => t.start).filter(isDate);
   if (!starts.length) return null;
-  return starts.reduce((a,b)=> a.getTime()<=b.getTime()?a:b);
+  return starts.reduce((a, b) => a.getTime() <= b.getTime() ? a : b);
 }
 
 /* ===================== MENU AND TRIGGERS ===================== */
 function onOpen(){
   ensureInstallableTriggers_();
-  SpreadsheetApp.getUi().createMenu('Clock-in Audit')
+  SpreadsheetApp.getUi().createMenu('Clock in Audit')
     .addItem('Reset tracker', 'resetTimesheetData')
     .addItem('Open Dashboard', 'openLookerStudioDashboard')
     .addSeparator()
-    .addItem('Build Clock-in Audit (CSV + Linxup)', 'auditClockInsFromCsvAndLinxup')
+    .addItem('Build Clock in Audit  CSV plus Linxup', 'auditClockInsFromCsvAndLinxup')
     .addToUi();
 }
 
 /* Clear Timesheet Raw for a fresh paste */
 function resetTimesheetData(){
   const ui = SpreadsheetApp.getUi();
-  const resp = ui.alert('Reset tracker', 'This clears all data in "Timesheet Raw". Continue?', ui.ButtonSet.OK_CANCEL);
+  const resp = ui.alert('Reset tracker', 'This clears all data in Timesheet Raw. Continue?', ui.ButtonSet.OK_CANCEL);
   if (resp !== ui.Button.OK) return;
   const sh = ensureTimesheetSheet_();
   sh.clear();
@@ -661,12 +877,13 @@ function resetTimesheetData(){
 
 /* Simple launcher for your dashboard */
 function openLookerStudioDashboard(){
+  const url = AUDCFG.lookerUrl || '';
   const html = HtmlService
     .createHtmlOutput(
       `<div style="font-family:Arial,sans-serif;padding:12px">
          <p>Open the dashboard in a new tab:</p>
-         <p><a href="${AUDCFG.lookerUrl}" target="_blank" rel="noopener">Open Looker Studio</a></p>
-         <script>try{window.open('${AUDCFG.lookerUrl}','_blank');}catch(e){}</script>
+         <p>${url ? `<a href="${url}" target="_blank" rel="noopener">Open Looker Studio</a>` : 'No dashboard URL set'}</p>
+         ${url ? `<script>try{window.open('${url}','_blank');}catch(e){}</script>` : ''}
        </div>`)
     .setWidth(320).setHeight(120);
   SpreadsheetApp.getUi().showModelessDialog(html, 'Looker Studio');
@@ -685,7 +902,7 @@ function ensureInstallableTriggers_(){
       ScriptApp.newTrigger('enforcePasteAtA1').forSpreadsheet(id).onEdit().create();
     }
   }catch(e){
-    // Silent fail, user can add trigger manually if needed
+    // Silent
   }
 }
 
@@ -699,12 +916,12 @@ function enforcePasteAtA1(e){
     const isAtA1 = rng.getRow() === 1 && rng.getColumn() === 1;
     const isMulti = rng.getNumRows() > 1 || rng.getNumColumns() > 1;
 
-    if (!isMulti) return;       // allow single cell edits
-    if (isAtA1) return;         // already correct
+    if (!isMulti) return;
+    if (isAtA1) return;
 
     const vals = rng.getValues();
-    sh.clear();                 // fresh paste area
-    sh.getRange(1,1,vals.length,vals[0].length).setValues(vals);
+    sh.clear();
+    sh.getRange(1, 1, vals.length, vals[0].length).setValues(vals);
     toast_('Moved pasted data to A1 in Timesheet Raw');
   }catch(err){
     // no op
@@ -720,20 +937,22 @@ function auditClockInsFromCsvAndLinxup(){
 
   // pull window using local date keys
   const allDates = summary.map(s => dateFromKeyLocal(s.dateKey)).filter(isDate);
-  const minDay = allDates.reduce((a,b)=> a.getTime()<=b.getTime()?a:b);
-  const maxDay = allDates.reduce((a,b)=> a.getTime()>=b.getTime()?a:b);
-  const winStart = new Date(minDay.getTime() - AUDCFG.tripsPadHours*3600000);
-  const winEnd   = new Date(maxDay.getTime() + (24*3600000) + AUDCFG.tripsPadHours*3600000);
+  const minDay = allDates.reduce((a, b) => a.getTime() <= b.getTime() ? a : b);
+  const maxDay = allDates.reduce((a, b) => a.getTime() >= b.getTime() ? a : b);
+  const winStart = new Date(minDay.getTime() - AUDCFG.tripsPadHours * 3600000);
+  const winEnd   = new Date(maxDay.getTime() + 24 * 3600000 + AUDCFG.tripsPadHours * 3600000);
 
-  // trips, usage, stops, visits
+  // trips, usage, stops, visits, geofence activity
   const trips  = fetchTripsBatched_(winStart, winEnd).map(normalizeTrip_);
   const usage  = fetchUsageBatched_(winStart, winEnd);
   const stops  = fetchStopsBatched_(winStart, winEnd);
   const visits = fetchVisitsBatched_(winStart, winEnd);
+  const fenceActs = fetchFenceActivityBatched_(winStart, winEnd);
 
   const usageIdx  = indexUsage_(usage);
   const stopsIdx  = indexStops_(stops);
   const visitsIdx = indexVisits_(visits);
+  const fenceIdx  = indexFenceActivity_(fenceActs);
 
   const { devUUIDToGroup, driverBaseToGroup } = buildGroupMaps_();
   const tripsByLabelDay = bucketTripsByLabelDay_(trips);
@@ -741,33 +960,33 @@ function auditClockInsFromCsvAndLinxup(){
   // output sheet and headers
   const sh = ensureAuditSheet_();
   const HEAD = [
-    'Note',                             // A new
-    'Date',                             // B
-    'Day of Week',                      // C
-    'Employee',                         // D
-    'Group',                            // E
-    'Pay Item',                         // F
-    'FieldEdge time employee clocked in',        // G
-    'Linxup time employee starts driving',       // H
-    'First Trip Start Location',                        // I
-    'Linxup time employee arrives site',          // J
-    'First Trip End Location',                           // K
-    'Δ In (min)',                                  // L
-    'FieldEdge clock out time',                    // M
-    'Linxup time employee left site',              // N
-    'Last Trip Start Location',                         // O
-    'Linxup time employee ended drive',            // P
-    'Last Trip End Location',                           // Q
-    'Δ Out (min)',                                 // R
-    'Matched Linxup Name'                          // S
+    'Note',                              // A
+    'Date',                              // B
+    'Day of Week',                       // C
+    'Employee',                          // D
+    'Group',                             // E
+    'Pay Item',                          // F
+    'FieldEdge time employee clocked in', // G
+    'Linxup time employee starts driving', // H
+    'First Trip Start Location',         // I
+    'Linxup time employee arrives site', // J
+    'First Trip End Location',           // K
+    'Δ In  min ',                        // L
+    'FieldEdge clock out time',          // M
+    'Linxup time employee left site',    // N
+    'Last Trip Start Location',          // O
+    'Linxup time employee ended drive',  // P
+    'Last Trip End Location',            // Q
+    'Δ Out  min ',                       // R
+    'Matched Linxup Name'                // S
   ];
   sh.clear();
-  sh.getRange(1,1,1,HEAD.length).setValues([HEAD]);
+  sh.getRange(1, 1, 1, HEAD.length).setValues([HEAD]);
   sh.setFrozenRows(1);
   sh.setConditionalFormatRules([]);
 
   const out = [];
-  const rowsNeedingBold = [];  // Row numbers to bold when clock out home match hits
+  const rowsNeedingBold = [];
 
   for (const s of summary){
     const labelsPinned = mapEmployeeToLabels_(s.employee);
@@ -775,33 +994,35 @@ function auditClockInsFromCsvAndLinxup(){
 
     // collect and filter to loose name matches for this date
     let dayTrips = [];
-    tripsByLabelDay.forEach((arr,k)=>{ if (k.endsWith(`|${s.dateKey}`)) arr.forEach(t=>dayTrips.push(t)); });
+    tripsByLabelDay.forEach((arr, k) => { if (k.endsWith(`|${s.dateKey}`)) arr.forEach(t => dayTrips.push(t)); });
     dayTrips = dayTrips.filter(t => tripMatchesByNameLoose_(t, labelsPinned));
-    dayTrips.sort((a,b)=>{
-      const aT = (isDate(a.start)?a.start.getTime():0) || (isDate(a.end)?a.end.getTime():0);
-      const bT = (isDate(b.start)?b.start.getTime():0) || (isDate(b.end)?b.end.getTime():0);
+    dayTrips.sort((a, b) => {
+      const aT = (isDate(a.start) ? a.start.getTime() : 0) || (isDate(a.end) ? a.end.getTime() : 0);
+      const bT = (isDate(b.start) ? b.start.getTime() : 0) || (isDate(b.end) ? b.end.getTime() : 0);
       return aT - bT;
     });
 
     let groupName = '';
     let matchedLinxName = '';
 
-    // clock in block
-    let arriveDT = null;                 // Date
-    let linxStartForInDate = null;       // Date
-    let startLabelForIn = '';            // text
-    let arriveLabel = '';                // text
+    /* CLOCK IN BLOCK */
+    let arriveDT = null;
+    let linxStartForInDate = null;
+    let startLabelForIn = '';
+    let arriveLabel = '';
     let dIn = '';
 
     if (isDate(s.feIn) && dayTrips.length){
       const pick = pickArrivalEnd_(dayTrips, s.feIn);
       if (pick){
         const trip = pick.src;
+        const devKey = devKeyOfTrip_(trip);
+
         arriveDT = pick.dt;
         matchedLinxName = matchedLinxName || trip.driverFull;
 
         groupName = firstNonEmpty(trip, ['groupName']) || groupName;
-        groupName = groupName || (trip.deviceUUID ? devUUIDToGroup.get(trip.deviceUUID) : '');
+        groupName = groupName || (devKey ? devUUIDToGroup.get(devKey) : '');
         if (!groupName && trip.driverFull){
           const base = norm(stripLinxDecorations(trip.driverFull));
           groupName = driverBaseToGroup.get(base) || groupName;
@@ -811,11 +1032,11 @@ function auditClockInsFromCsvAndLinxup(){
 
         // end label at arrival
         if (!arriveLabel){
-          const lu = labelFromUsage_(usageIdx, trip.deviceUUID, arriveDT.getTime(), 'end');
+          const lu = labelFromUsage_(usageIdx, devKey, arriveDT.getTime(), 'end');
           arriveLabel = lu.label || ''; groupName = groupName || lu.group || '';
         }
         if (!arriveLabel){
-          const ls = labelFromStops_(stopsIdx, trip.deviceUUID, arriveDT.getTime());
+          const ls = labelFromStops_(stopsIdx, devKey, arriveDT.getTime());
           arriveLabel = ls.label || ''; groupName = groupName || ls.group || '';
         }
         if (!arriveLabel) arriveLabel = labelFromVisits_(visitsIdx, trip, arriveDT.getTime()) || '';
@@ -824,11 +1045,11 @@ function auditClockInsFromCsvAndLinxup(){
         // start label at the same trip
         const startMs = isDate(trip.start) ? trip.start.getTime() : arriveDT.getTime();
         if (!startLabelForIn){
-          const luS = labelFromUsage_(usageIdx, trip.deviceUUID, startMs, 'start');
+          const luS = labelFromUsage_(usageIdx, devKey, startMs, 'start');
           startLabelForIn = luS.label || ''; groupName = groupName || luS.group || '';
         }
         if (!startLabelForIn){
-          const lsS = labelFromStops_(stopsIdx, trip.deviceUUID, startMs);
+          const lsS = labelFromStops_(stopsIdx, devKey, startMs);
           startLabelForIn = lsS.label || ''; groupName = groupName || lsS.group || '';
         }
         if (!startLabelForIn) startLabelForIn = labelFromVisits_(visitsIdx, trip, startMs) || '';
@@ -840,22 +1061,25 @@ function auditClockInsFromCsvAndLinxup(){
       }
     }
 
-    // clock out block
-    let leaveDT = null;                  // Date
-    let linxEndForOutDate = null;        // Date
-    let leaveLabel = '';                 // text
-    let endLabelForOut = '';             // text
+    /* CLOCK OUT BLOCK */
+    let leaveDT = null;
+    let linxEndForOutDate = null;
+    let leaveLabel = '';
+    let endLabelForOut = '';
     let dOut = '';
+    let idleAdjustAtOutMin = 0;
+    let idleAdjustReason = '';
 
     if (isDate(s.feOut) && dayTrips.length){
       const pick2 = pickLeaveStart_(dayTrips, s.feOut);
       if (pick2){
         const trip2 = pick2.src;
+        const devKey2 = devKeyOfTrip_(trip2);
         leaveDT = pick2.dt;
         matchedLinxName = matchedLinxName || trip2.driverFull;
 
         groupName = groupName || firstNonEmpty(trip2, ['groupName']);
-        groupName = groupName || (trip2.deviceUUID ? devUUIDToGroup.get(trip2.deviceUUID) : '');
+        groupName = groupName || (devKey2 ? devUUIDToGroup.get(devKey2) : '');
         if (!groupName && trip2.driverFull){
           const base2 = norm(stripLinxDecorations(trip2.driverFull));
           groupName = driverBaseToGroup.get(base2) || groupName;
@@ -865,11 +1089,11 @@ function auditClockInsFromCsvAndLinxup(){
 
         // start label at leave trip
         if (!leaveLabel){
-          const lu2 = labelFromUsage_(usageIdx, trip2.deviceUUID, leaveDT.getTime(), 'start');
+          const lu2 = labelFromUsage_(usageIdx, devKey2, leaveDT.getTime(), 'start');
           leaveLabel = lu2.label || ''; groupName = groupName || lu2.group || '';
         }
         if (!leaveLabel){
-          const ls2 = labelFromStops_(stopsIdx, trip2.deviceUUID, leaveDT.getTime());
+          const ls2 = labelFromStops_(stopsIdx, devKey2, leaveDT.getTime());
           leaveLabel = ls2.label || ''; groupName = groupName || ls2.group || '';
         }
         if (!leaveLabel) leaveLabel = labelFromVisits_(visitsIdx, trip2, leaveDT.getTime()) || '';
@@ -878,28 +1102,47 @@ function auditClockInsFromCsvAndLinxup(){
         // end label at leave trip
         const endMs = isDate(trip2.end) ? trip2.end.getTime() : leaveDT.getTime();
         if (!endLabelForOut){
-          const luE = labelFromUsage_(usageIdx, trip2.deviceUUID, endMs, 'end');
+          const luE = labelFromUsage_(usageIdx, devKey2, endMs, 'end');
           endLabelForOut = luE.label || ''; groupName = groupName || luE.group || '';
         }
         if (!endLabelForOut){
-          const lsE = labelFromStops_(stopsIdx, trip2.deviceUUID, endMs);
+          const lsE = labelFromStops_(stopsIdx, devKey2, endMs);
           endLabelForOut = lsE.label || ''; groupName = groupName || lsE.group || '';
         }
         if (!endLabelForOut) endLabelForOut = labelFromVisits_(visitsIdx, trip2, endMs) || '';
         if (!endLabelForOut) endLabelForOut = trip2.rawEndLoc || '';
 
-        if (s.feOut.getTime() > leaveDT.getTime()){
+        // Prefer geofence exit  else STOP end  to move past idling
+        if (isDate(leaveDT)){
+          const gAdj = geofenceExitFromActivity_(fenceIdx, devKey2, leaveDT.getTime(),
+                                       isDate(linxEndForOutDate) ? linxEndForOutDate.getTime() : NaN,
+                                       leaveLabel);
+
+          if (gAdj){
+            leaveDT = gAdj.dt;
+            idleAdjustAtOutMin = gAdj.idleMin;
+            idleAdjustReason = 'fence';
+          } else {
+            const sAdj = adjustDepartureImmediateStopEnd_(trip2, leaveDT, leaveLabel, stopsIdx);
+            if (sAdj.adjusted){
+              leaveDT = sAdj.dt;
+              idleAdjustAtOutMin = sAdj.idleMin;
+              idleAdjustReason = 'stop';
+            }
+          }
+        }
+
+        if (isDate(s.feOut) && isDate(leaveDT) && s.feOut.getTime() > leaveDT.getTime()){
           dOut = minutesBetween(leaveDT, s.feOut).toFixed(1);
         }
       }
     }
 
-    // fill missing group from any day trip if needed
+    // fill missing group from any day trip
     if (!groupName && dayTrips.length){
       for (const t of dayTrips){
-        if (t.deviceUUID && devUUIDToGroup.has(t.deviceUUID)){
-          groupName = devUUIDToGroup.get(t.deviceUUID); break;
-        }
+        const dk = devKeyOfTrip_(t);
+        if (dk && devUUIDToGroup.has(dk)){ groupName = devUUIDToGroup.get(dk); break; }
       }
     }
     if (!groupName && matchedPinned){
@@ -907,21 +1150,25 @@ function auditClockInsFromCsvAndLinxup(){
       groupName = driverBaseToGroup.get(baseP) || '';
     }
 
-    // set matched name if still empty
     if (!matchedLinxName && dayTrips.length) matchedLinxName = dayTrips[0].driverFull;
     if (!matchedLinxName) matchedLinxName = matchedPinned;
 
-    // Home flag logic for column A note and for formatting
+    // Notes and flags
     const notesA = [];
-    let homeInFlag = false;
     let homeOutFlag = false;
 
     if (isDate(s.feIn) && isDate(linxStartForInDate) && isHomeLabel(startLabelForIn)){
       const diffIn = minutesBetween(s.feIn, linxStartForInDate);
       if (diffIn <= 5 || s.feIn.getTime() <= linxStartForInDate.getTime()){
-        homeInFlag = true;
         notesA.push('Home at Clock In');
       }
+    }
+
+    if (idleAdjustAtOutMin > 0){
+      const txt = idleAdjustReason === 'fence'
+        ? `Adjusted departure to geofence exit  ${idleAdjustAtOutMin.toFixed(1)} min idle`
+        : `Adjusted departure for idle  ${idleAdjustAtOutMin.toFixed(1)} min`;
+      notesA.push(txt);
     }
 
     if (isDate(s.feOut) && isDate(linxEndForOutDate) && isHomeLabel(endLabelForOut)){
@@ -931,70 +1178,63 @@ function auditClockInsFromCsvAndLinxup(){
         notesA.push('Home at Clock Out');
       }
     }
-    // Add an explicit note for Overtime highlights so it's obvious why it's yellow
-    const otNote = overtimeNoteFromPayItem_(s.payItem);
-    if (otNote && !notesA.some(n => /^overtime/i.test(n))) {
-      notesA.push(otNote);
-    }
 
-    // local weekday
+    const otNote = overtimeNoteFromPayItem_(s.payItem);
+    if (otNote && !notesA.some(n => /^overtime/i.test(n))) notesA.push(otNote);
+
     const localDay = dateFromKeyLocal(s.dateKey);
     const weekday = localDay ? fmt(localDay, 'EEEE') : '';
 
-    // push row
     out.push([
-      notesA.join('; '),                                 // A Note
-      s.dateKey,                                         // B Date (text yyyy-MM-dd)
+      notesA.join('; '),                                 // A
+      s.dateKey,                                         // B
       weekday,                                           // C
       s.employee,                                        // D
       groupName,                                         // E
       s.payItem || '',                                   // F
-      isDate(s.feIn) ? new Date(s.feIn) : '',            // G time
-      isDate(linxStartForInDate) ? new Date(linxStartForInDate) : '', // H time
-      startLabelForIn,                                   // I start location at clock in
-      isDate(arriveDT) ? new Date(arriveDT) : '',        // J time
-      arriveLabel,                                       // K end location at clock in
+      isDate(s.feIn) ? new Date(s.feIn) : '',            // G
+      isDate(linxStartForInDate) ? new Date(linxStartForInDate) : '', // H
+      startLabelForIn,                                   // I
+      isDate(arriveDT) ? new Date(arriveDT) : '',        // J
+      arriveLabel,                                       // K
       dIn,                                               // L
-      isDate(s.feOut) ? new Date(s.feOut) : '',          // M time
-      isDate(leaveDT) ? new Date(leaveDT) : '',          // N time
-      leaveLabel,                                        // O start location at clock out
-      isDate(linxEndForOutDate) ? new Date(linxEndForOutDate) : '',   // P time
-      endLabelForOut,                                    // Q end location at clock out
+      isDate(s.feOut) ? new Date(s.feOut) : '',          // M
+      isDate(leaveDT) ? new Date(leaveDT) : '',          // N
+      leaveLabel,                                        // O
+      isDate(linxEndForOutDate) ? new Date(linxEndForOutDate) : '',   // P
+      endLabelForOut,                                    // Q
       dOut,                                              // R
       matchedLinxName                                    // S
     ]);
 
-    // remember rows to bold when out condition hit
     if (homeOutFlag){
-      const justPushedIndex = out.length;         // 1 based within data rows
-      const absoluteRowNum = 1 + justPushedIndex; // header is row 1
+      const justPushedIndex = out.length;
+      const absoluteRowNum = 1 + justPushedIndex;
       rowsNeedingBold.push(absoluteRowNum);
     }
   }
 
   // sort by Group then Date then Employee
-  out.sort((a,b)=>
-    String(a[4]||'').localeCompare(String(b[4]||'')) ||   // Group at E
-    String(a[1]||'').localeCompare(String(b[1]||'')) ||   // Date at B
-    String(a[3]||'').localeCompare(String(b[3]||''))      // Employee at D
+  out.sort((a, b) =>
+    String(a[4] || '').localeCompare(String(b[4] || '')) ||
+    String(a[1] || '').localeCompare(String(b[1] || '')) ||
+    String(a[3] || '').localeCompare(String(b[3] || ''))
   );
 
-  if (out.length) sh.getRange(2,1,out.length,HEAD.length).setValues(out);
+  if (out.length) sh.getRange(2, 1, out.length, HEAD.length).setValues(out);
 
-  // number formats for time and minutes
+  // formats
   const lastRow = sh.getLastRow();
   const lastCol = sh.getLastColumn();
   if (lastRow > 1){
-    const timeCols = [7,8,10,13,14,16]; // G,H,J,M,N,P
-    timeCols.forEach(c => sh.getRange(2, c, lastRow - 1, 1).setNumberFormat('yyyy-mm-dd h:mm am/pm'));
+    const timeCols = [7, 8, 10, 13, 14, 16]; // G H J M N P
+    timeCols.forEach(c => sh.getRange(2, c, lastRow - 1, 1).setNumberFormat('yyyy mm dd h:mm am/pm'));
     sh.getRange(2, 12, lastRow - 1, 1).setNumberFormat('0.0'); // Δ In
     sh.getRange(2, 18, lastRow - 1, 1).setNumberFormat('0.0'); // Δ Out
   }
 
-  // apply conditional formatting rules including the new home checks
   highlightOvertimeRows_(sh);
 
-  // bold rows for clock out home flag to match your visual cue
   if (rowsNeedingBold.length){
     rowsNeedingBold.forEach(r => {
       if (r >= 2 && r <= sh.getLastRow()){
@@ -1007,13 +1247,9 @@ function auditClockInsFromCsvAndLinxup(){
   toast_(`Clock in Audit built: ${out.length} rows`);
 }
 
-
-
-
-
 function colToA1_(n){
   let s = '';
-  while(n > 0){
+  while (n > 0){
     const m = (n - 1) % 26;
     s = String.fromCharCode(65 + m) + s;
     n = Math.floor((n - 1) / 26);
@@ -1026,9 +1262,7 @@ function highlightOvertimeRows_(sh){
   const lastCol = sh.getLastColumn();
   if (lastRow <= 1) return;
 
-  // dynamic header lookup
-  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0]
-    .map(v => String(v || '').trim());
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(v => String(v || '').trim());
   const lower = headers.map(h => h.toLowerCase());
 
   const payIdx  = lower.indexOf('pay item');
@@ -1037,40 +1271,68 @@ function highlightOvertimeRows_(sh){
   const dataRange = sh.getRange(2, 1, lastRow - 1, lastCol);
   const rules = [];
 
-  // Overtime row highlight as before
   if (payIdx >= 0){
     const payColLetter = colToA1_(payIdx + 1);
     rules.push(
       SpreadsheetApp.newConditionalFormatRule()
         .setRanges([dataRange])
         .whenFormulaSatisfied(`=REGEXMATCH($${payColLetter}2,"(?i)overtime")`)
-        .setBackground('#fff2cc') // light yellow
+        .setBackground('#fff2cc')
         .build()
     );
   }
 
-  // Home at Clock In red background
   if (noteIdx >= 0){
     const noteColLetter = colToA1_(noteIdx + 1);
     rules.push(
       SpreadsheetApp.newConditionalFormatRule()
         .setRanges([dataRange])
         .whenFormulaSatisfied(`=REGEXMATCH($${noteColLetter}2,"Home at Clock In")`)
-        .setBackground('#ffd6d6') // soft red
+        .setBackground('#ffd6d6')
         .build()
     );
-
-    // Home at Clock Out strong red with white text
     rules.push(
       SpreadsheetApp.newConditionalFormatRule()
         .setRanges([dataRange])
         .whenFormulaSatisfied(`=REGEXMATCH($${noteColLetter}2,"Home at Clock Out")`)
-        .setBackground('#d32f2f') // red
+        .setBackground('#d32f2f')
         .setFontColor('#ffffff')
         .build()
     );
   }
-
   sh.setConditionalFormatRules(rules);
 }
 
+/* ===================== ONE TIME PROPERTY SETTER  DO NOT COMMIT REAL VALUES ===================== */
+function setSecretsOnce(){
+  const p = PropertiesService.getScriptProperties();
+  p.setProperties({
+    TIMEZONE: 'America/Toronto',
+
+    LINXUP_HOST: 'https colon slash slash app02 dot linxup dot com',
+    LINXUP_BASE: '/ibis/rest/api/v2',
+    LINXUP_TOKEN: 'paste real token here',
+
+    AUDIT_SHEET_ID: '',
+    TIMESHEET_SHEET_NAME: 'Timesheet Raw',
+    AUDIT_SHEET_NAME: 'Clock in Audit',
+
+    AUDIT_TRIPS_PAD_HOURS: '12',
+    MATCH_WINDOW_MIN: '120',
+    HOME_FLAG_MIN: '5',
+    LABEL_WINDOW_MIN: '15',
+    MIN_MOVEMENT_MIN: '4',
+    MIN_MOVEMENT_KM: '2',
+    IDLE_ADJUST_MIN_MIN: '2',
+    IDLE_ADJUST_MAX_WINDOW_MIN: '200',
+    MIN_CLOCK_DUR_MIN: '3',
+
+    LOOKER_URL: '',
+
+    // Redacted mapping  example only
+    PIN_MATCHES_JSON: JSON.stringify({
+      "A. Worker": "Alex Worker",
+      "B. Tech": "Ben Tech"
+    })
+  }, true);
+}
