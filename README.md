@@ -1,93 +1,101 @@
-# FieldEdge ↔ Linxup Clock Audit (Google Apps Script)
+# Clock-in vs Trips Audit (FieldEdge ↔ Linxup)
 
-Reconciles **FieldEdge** timesheets with **Linxup** trips in Google Sheets, flags **home clock‑ins/outs** and **overtime**, and writes a plain‑English reason in the **Note** column for every highlight.
+Google Apps Script to reconcile FieldEdge timesheet clock-in/out with Linxup GPS trip data.  
+This safe public version contains **no secrets or private data**. All configuration is loaded from Script Properties.
 
-## What it does
+---
 
-- Parses a FieldEdge timesheet CSV (“**Timesheet Raw**” sheet).
-- Summarizes per employee per day: **first valid clock‑in** and **last valid clock‑out** (ignores rows ≤ 3 minutes by default).
-- Pulls **Linxup trips/usage/stops/visits** in batched windows and loosely matches them to employees using a **pinned name map**.
-- Builds a “**Clock‑in Audit**” sheet with:
-  - FE clock in/out, Linxup trip start/end, start/end geofence labels, and Δ minutes.
-  - **Conditional formatting**:
-    - Overtime → **light yellow** (Note includes “Overtime 1.5” or “Overtime 2” when detectable).
-    - **Home at Clock In** → soft red.
-    - **Home at Clock Out** → red with white text.
-  - **Note column** clearly explains every highlight (“Home at Clock In”, “Home at Clock Out”, “Overtime 1.5/2”, etc.).
+## What this script does
 
-## Why
+- Compares **FieldEdge timesheet entries** with **Linxup trip/stop/geofence data**.
+- Identifies:
+  - When employees actually left/arrived compared to when they clocked in/out.
+  - Idling before departure and adjusts the “leave” time to the geofence exit (preferred) or stop end.
+- Adds Pay Item details for the day and highlights overtime rows.
+- Provides a simple menu inside Google Sheets:
+  - Reset tracker (clear Timesheet Raw).
+  - Open Looker Studio dashboard (optional link).
+  - Build the full Clock-in Audit.
 
-This helps ops quickly see risky behavior such as clocking in from **Home** at the same time driving starts, or clocking out when the trip ends at **Home**, and provides a paper trail backed by GPS events.
+---
 
-## Requirements
+## Setup instructions
 
-- Google account with access to Google Sheets & Apps Script.
-- Linxup API token.
-- A FieldEdge CSV export with columns: `Employee`, `Status Date`, `Start Time`, `End Time`, `Duration`, `Pay Item`.
+1. Open a new [Google Apps Script](https://script.google.com/).
+2. Paste the full script file (`Code.gs`) from this repository.
+3. Deploy it or bind it to the Google Sheet where you want audits to appear.
+4. Run the helper `setSecretsOnce()` once, then open **Project Settings → Script Properties** and edit the keys with your real values (see below).
+5. In your Sheet:
+   - Ensure a sheet named **Timesheet Raw** exists. Paste your CSV there starting at cell A1.
+   - The script will output results to a sheet named **Clock in Audit**.
 
-## Setup
+---
 
-1. **Create a Google Sheet** with two sheets:
-   - **Timesheet Raw** (you will paste the CSV at A1)
-   - **Clock‑in Audit** (script will populate this)
-2. **Open Extensions → Apps Script** and paste the code from this repo into `Code.gs`.
-3. **Script Properties** (Apps Script → Project Settings → Script properties):
-   - `TIMEZONE` – e.g. `America/Toronto`.
-   - `LINXUP_TOKEN` – your Linxup API token (secret).
-   - *(Optional)* `AUDIT_SHEET_ID` – the spreadsheet ID if running the script from another container.
-   - *(Optional)* `AUDIT_TRIPS_PAD_HOURS` – default 12.
-   - *(Optional)* `MATCH_WINDOW_MIN` – default 120.
-   - *(Optional)* `LABEL_WINDOW_MIN` – default 15.
-   - *(Optional)* `LOOKER_URL` – dashboard URL (or leave the placeholder).
-   - **`PIN_MATCHES_JSON`** – JSON mapping from the short timesheet name to the Linxup driver name you want to match (example below).
-4. **Employee mapping example** for `PIN_MATCHES_JSON` (do **not** commit real names):
-   ```json
-   {
-     "A. Worker": "Alice Worker",
-     "B. Driver": "Bob Driver"
-   }
+## Required Script Properties
 
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-(Optional) Add the on‑edit trigger via the menu (script does this automatically):
+These are loaded at runtime — **do not commit real values**.
 
-Clock‑in Audit → Reset tracker / Build Clock‑in Audit menu appears when the sheet opens.
+| Key                        | Example / Notes                                  |
+|----------------------------|--------------------------------------------------|
+| `TIMEZONE`                 | `America/Toronto`                                |
+| `LINXUP_HOST`              | `https://appXX.linxup.com`                       |
+| `LINXUP_BASE`              | `/ibis/rest/api/v2`                              |
+| `LINXUP_TOKEN`             | *(Bearer token string)*                          |
+| `AUDIT_SHEET_ID`           | Optional. Leave blank to use active sheet.       |
+| `TIMESHEET_SHEET_NAME`     | `Timesheet Raw`                                  |
+| `AUDIT_SHEET_NAME`         | `Clock in Audit`                                 |
+| `AUDIT_TRIPS_PAD_HOURS`    | `12`                                             |
+| `MATCH_WINDOW_MIN`         | `120`                                            |
+| `HOME_FLAG_MIN`            | `5`                                              |
+| `LABEL_WINDOW_MIN`         | `15`                                             |
+| `MIN_MOVEMENT_MIN`         | `4`                                              |
+| `MIN_MOVEMENT_KM`          | `2`                                              |
+| `IDLE_ADJUST_MIN_MIN`      | `2`                                              |
+| `IDLE_ADJUST_MAX_WINDOW_MIN` | `200`                                          |
+| `MIN_CLOCK_DUR_MIN`        | `3`                                              |
+| `LOOKER_URL`               | Optional dashboard URL                           |
+| `PIN_MATCHES_JSON`         | JSON mapping of short names to full names        |
+
+### Example for `PIN_MATCHES_JSON`
+```json
+{
+  "A. Worker": "Alex Worker",
+  "B. Tech": "Ben Technician"
+}
+Use placeholder values in public repos. Store real employee names only in your Script Properties.
 
 Usage
 
-Paste the FieldEdge CSV at A1 of the Timesheet Raw sheet.
+Open the Google Sheet.
 
-From the menu Clock‑in Audit → Build Clock‑in Audit (CSV + Linxup).
+Paste timesheet CSV into Timesheet Raw starting at cell A1.
 
-Review the Clock‑in Audit sheet:
+From the Clock-in Audit menu (added by the script):
 
-Yellow rows = Overtime (Note shows Overtime 1.5/Overtime 2 when detectable).
+Run Build Clock-in Audit.
 
-Soft red = Home at Clock In (times within ≤ 5 minutes, or FE clock‑in ≤ Linxup start).
+Results are written to the Clock in Audit sheet:
 
-Strong red + white text = Home at Clock Out (FE clock‑out within ≤ 5 minutes of Linxup end at Home).
+Notes on idling, overtime, or home start/stop.
 
-Note column explains why a row is highlighted.
+Δ In / Δ Out minutes differences.
 
-Configuration notes
+Conditional formatting highlights overtime and “home at clock in/out”.
 
-Minimum FE duration to consider a row valid: 3 minutes (strict “> 3”).
+Safety & Privacy
 
-Matching window for FE vs. Linxup candidates: 120 minutes by default.
+No tokens or names are stored in this repo.
 
-Geofence label resolution tries Usage then Stops, then Visits, then raw trip text.
+All sensitive values (API tokens, sheet IDs, employee names) must be set via Script Properties.
 
-Privacy & Security
+The fetch wrapper trims HTTP error bodies to avoid leaking secrets into logs.
 
-No secrets in code: All tokens/IDs are read from Script Properties.
+This repo is safe to share publicly.
 
-No PII in repo: Do not commit real employee names; set them via PIN_MATCHES_JSON.
+Development
 
-Add a .gitignore (see repo) to avoid accidentally publishing IDs from .clasp.json if you use clasp.
+Code is structured to be modular: config, utilities, API fetchers, and main audit builder.
 
-Troubleshooting
+Conditional formatting rules are applied programmatically.
 
-“LINXUP_TOKEN not set” – Set LINXUP_TOKEN in Script Properties.
-
-“applyAuditFormattingRules_ is not defined” – This repo uses highlightOvertimeRows_() only; remove any older calls to applyAuditFormattingRules_.
-
-If geofence labels look sparse, increase LABEL_WINDOW_MIN (default 15).
+You can adapt the PIN list to load from a hidden Config sheet instead of Script Properties if preferred.
